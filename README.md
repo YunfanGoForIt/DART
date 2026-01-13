@@ -1,7 +1,3 @@
-以下是您提供的 **MCP DeepWiki Documentation Automator** 项目文档的中英对照版本，已按段落结构进行双语排版，便于阅读与参考：
-
----
-
 # MCP DeepWiki Documentation Automator  
 # MCP DeepWiki 文档自动化工具
 
