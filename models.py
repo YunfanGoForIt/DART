@@ -11,6 +11,7 @@ class ProcessingStatus(enum.Enum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
+    SKIPPED = "skipped"  # 冷门仓库（文档不足）跳过处理
 
 class ProcessedRepo(Base):
     __tablename__ = "processed_repos"
