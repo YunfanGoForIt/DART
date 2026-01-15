@@ -40,6 +40,29 @@ class FeishuService:
             logger.error(f"Error creating Feishu node: {e}")
             return None
 
+    async def update_node_title(self, node_token: str, title: str) -> bool:
+        """Update wiki node title"""
+        try:
+            request = UpdateSpaceNodeRequest.builder() \
+                .space_id(str(self.space_id)) \
+                .node_token(str(node_token)) \
+                .request_body(UpdateNodeRequestBody.builder()
+                    .title(title)
+                    .build()) \
+                .build()
+
+            response = self.client.wiki.v2.space_node.update(request)
+
+            if not response.success():
+                logger.error(f"Feishu update node title error: {response.code} - {response.msg}")
+                return False
+
+            logger.info(f"✅ Updated document title: {title}")
+            return True
+        except Exception as e:
+            logger.error(f"Error updating Feishu node title: {e}")
+            return False
+
     async def update_document_content(self, document_id: str, markdown_content: str):
         blocks = self._parse_markdown_to_blocks(markdown_content)
         

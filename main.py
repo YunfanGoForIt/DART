@@ -91,9 +91,11 @@ class TaskQueue:
     def mark_task_done(self):
         """标记当前任务完成"""
         if self.current_task:
-            repo_id = self.current_task["data"].get("repo_id")
+            # 兼容两种格式：GitHub API 用 "id"，重新生成用 "repo_id"
+            repo_id = self.current_task["data"].get("repo_id") or str(self.current_task["data"].get("id", ""))
             if repo_id:
                 self.repo_ids_in_queue.discard(repo_id)
+                logger.info(f"✅ 任务完成，已从队列移除: {repo_id}")
 
             # 从列表中移除已完成的任务
             self.task_list = [t for t in self.task_list if t != self.current_task]
@@ -233,7 +235,17 @@ async def process_repo_workflow(db: Session, repo_data: dict):
         # Final Expand
         logger.info(f"🔄 正在通过 RAG 扩展内容...")
         final_content = await rag_refiner.expand_with_rag(draft)
-        
+
+        # Save to local final_docs folder
+        logger.info(f"💾 保存最终文档到本地...")
+        final_docs_dir = "/www/wwwroot/mcp_deepwiki/final_docs"
+        os.makedirs(final_docs_dir, exist_ok=True)
+        safe_name = repo_name.replace("/", "_")
+        final_doc_path = os.path.join(final_docs_dir, f"{safe_name}.md")
+        with open(final_doc_path, "w", encoding="utf-8") as f:
+            f.write(final_content)
+        logger.info(f"✅ 最终文档已保存: {final_doc_path}")
+
         # 3. Upload to Feishu
         logger.info(f"📤 正在上传到飞书知识库...")
         # Use AI-generated title with repo name
@@ -249,6 +261,8 @@ async def process_repo_workflow(db: Session, repo_data: dict):
         else:
             logger.info(f"📝 更新已有飞书文档")
             doc_token = db_repo.feishu_doc_token
+            # 更新文档标题
+            await feishu_service.update_node_title(doc_token, title)
 
         if doc_token:
             # Note: update_document_content currently appends content.
@@ -438,6 +452,16 @@ async def regenerate_repo_workflow_impl(db: Session, repo_id: str):
             # Final Expand
             final_content = await rag_refiner.expand_with_rag(draft)
 
+            # Save to local final_docs folder
+            logger.info(f"💾 保存最终文档到本地...")
+            final_docs_dir = "/www/wwwroot/mcp_deepwiki/final_docs"
+            os.makedirs(final_docs_dir, exist_ok=True)
+            safe_name = repo_name.replace("/", "_")
+            final_doc_path = os.path.join(final_docs_dir, f"{safe_name}.md")
+            with open(final_doc_path, "w", encoding="utf-8") as f:
+                f.write(final_content)
+            logger.info(f"✅ 最终文档已保存: {final_doc_path}")
+
             # Generate AI Title
             ai_title = await rag_refiner.generate_title(
                 repo_name=repo_name,
@@ -449,6 +473,9 @@ async def regenerate_repo_workflow_impl(db: Session, repo_id: str):
             title = f"{repo_name} - {ai_title}"
             logger.info(f"📌 重新生成文档标题：{title}")
 
+            # 更新文档标题
+            await feishu_service.update_node_title(db_repo.feishu_doc_token, title)
+            # 更新文档内容
             await feishu_service.update_document_content(db_repo.feishu_doc_token, final_content)
 
             # Send notification
@@ -488,25 +515,57 @@ async def sync_task(sync_all: bool = False, silent: bool = False):
         # 1. Fetch new star repositories from GitHub
         stars = await github_monitor.fetch_recent_stars(limit=10)
 
-        # 2. Query pending/failed repositories
+        # 记录已处理的 GitHub star ID，避免重复
+        processed_star_ids = set()
+
+        # Collect all repos to process
+        repos_to_process = []
+
+        # 2. Process GitHub stars（只处理需要处理的）
+        for star in stars:
+            repo_id = str(star["id"])
+            processed_star_ids.add(repo_id)  # 记录已处理
+
+            db_repo = db.query(ProcessedRepo).filter(ProcessedRepo.repo_id == repo_id).first()
+
+            # 检查是否需要加入队列：
+            # - 数据库中不存在 → 需要处理
+            # - 数据库中是 PENDING/FAILED → 需要处理
+            # - 数据库中是 COMPLETED/PROCESSING/SKIPPED → 不处理
+            should_process = False
+            if not db_repo:
+                # 新仓库，创建记录
+                db_repo = ProcessedRepo(
+                    repo_id=repo_id,
+                    repo_name=star["full_name"],
+                    repo_url=star["html_url"],
+                    description=star.get("description"),
+                    status=ProcessingStatus.PENDING
+                )
+                db.add(db_repo)
+                db.commit()
+                should_process = True
+            elif db_repo.status in [ProcessingStatus.PENDING, ProcessingStatus.FAILED]:
+                # 待处理或失败的，需要重试
+                should_process = True
+
+            # 如果需要处理，且不在队列中，则加入
+            if should_process and not task_queue.is_repo_in_queue(repo_id):
+                repos_to_process.append(star)  # 直接使用 GitHub API 的原始格式
+
+        # 3. 查询数据库中其他的 PENDING/FAILED 仓库（排除 GitHub star 列表中的）
         pending_repos = db.query(ProcessedRepo).filter(
             (ProcessedRepo.status == ProcessingStatus.PENDING) |
             (ProcessedRepo.status == ProcessingStatus.FAILED)
         ).all()
 
-        # Collect all repos to process
-        repos_to_process = []
-
-        # Add new stars
-        for star in stars:
-            repo_id = str(star["id"])
-            # Check if already in queue
-            if not task_queue.is_repo_in_queue(repo_id):
-                repos_to_process.append(star)  # 直接使用 GitHub API 的原始格式
-
         # Add pending/failed repos（转换为 GitHub API 格式）
         for repo in pending_repos:
-            # Check if already in queue
+            # 跳过已经在 GitHub star 列表中处理过的
+            if repo.repo_id in processed_star_ids:
+                continue
+
+            # 检查是否已在队列中
             if not task_queue.is_repo_in_queue(repo.repo_id):
                 repos_to_process.append({
                     "id": repo.repo_id,  # 使用 "id" 而不是 "repo_id"
